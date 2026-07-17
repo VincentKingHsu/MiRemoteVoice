@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleDisplayName</key>
+    <string>米遥桥</string>
+    <key>CFBundleExecutable</key>
+    <string>MiRemoteBridge</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.simaqingfeng.MiRemoteBridge</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>MiRemoteBridge</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0-beta.1</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>连接小米蓝牙语音遥控器并接收按住说话的音频。</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>连接小米蓝牙语音遥控器并接收按住说话的音频。</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>轻点语音键时，将 MacBook 麦克风送入豆包；按住时切换到遥控器麦克风。</string>
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>识别遥控器语音键的短按和长按，并阻止按键自动重复。</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>

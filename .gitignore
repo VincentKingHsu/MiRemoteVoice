@@ -1,0 +1,12 @@
+.DS_Store
+.vscode/
+mi-ao/
+
+**/.build/
+**/dist/
+**/build/
+**/recordings/
+*.wav
+*.raw.bin
+*.pcm
+
