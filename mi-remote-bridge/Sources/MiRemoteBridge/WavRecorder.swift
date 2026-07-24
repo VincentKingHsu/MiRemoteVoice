@@ -1,19 +1,17 @@
 // Tiny WAV file writer for diagnostic audio capture.
-// Saves 16-bit mono PCM at 16 kHz to /tmp/mi-voice-NN.wav.
-// Use `afplay /tmp/mi-voice-NN.wav` to listen.
+// Saves 16-bit mono PCM at 16 kHz under Application Support only when the
+// user explicitly enables diagnostic recording in the menu.
 
 import Foundation
 
 final class WavRecorder {
-    static var nextIndex = 0
     static func createNext(prefix: String) -> WavRecorder? {
-        let idx = nextIndex
-        nextIndex += 1
-        let base = "\(prefix)-\(String(format: "%02d", idx))"
-        // Project-local recordings dir, alongside the source.
-        let dir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("recordings", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
+        let base = "\(prefix)-\(formatter.string(from: Date()))"
+        let dir = AppStorage.recordingsDirectory
+        AppStorage.ensureDirectory(dir)
         let wavURL = dir.appendingPathComponent("\(base).wav")
         let rawURL = dir.appendingPathComponent("\(base).raw.bin")
         return WavRecorder(wavURL: wavURL, rawURL: rawURL, basename: base)
@@ -91,7 +89,7 @@ final class WavRecorder {
         }
     }
 
-    /// Convenience: returns basename (e.g. "mi-voice-03"). Files: /tmp/<basename>.wav and .raw.bin.
+    /// Convenience: returns the generated WAV basename.
     var filename: String { "\(basename).wav" }
 
     private static func makeHeader(

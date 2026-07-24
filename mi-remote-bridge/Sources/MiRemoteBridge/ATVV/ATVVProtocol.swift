@@ -49,6 +49,8 @@ final class ATVVProtocol {
     private(set) var codec: ATVVCodec?
     private var decoder = ADPCMDecoder()
     private var v10Sequence: UInt16 = 0
+    private var audioStreamActive = false
+    private var hasPendingSyncBeforeStart = false
 
     let getCapabilitiesCommand = Data([0x0A, 0x01, 0x00, 0x00, 0x03, 0x03])
 
@@ -60,6 +62,8 @@ final class ATVVProtocol {
         self.codec = selected
         decoder.reset(predictor: 0, stepIndex: 0)
         v10Sequence = 0
+        audioStreamActive = false
+        hasPendingSyncBeforeStart = false
     }
 
     func micOpenCommand() throws -> Data {
@@ -169,16 +173,42 @@ final class ATVVProtocol {
         self.codec = codec
         v10Sequence = sequence
         decoder.reset(predictor: predictor, stepIndex: stepIndex)
+        // A sync received before AUDIO_START belongs to the upcoming stream
+        // and must survive beginAudioStream(). A sync received while already
+        // streaming applies immediately but must not leak into the next one.
+        hasPendingSyncBeforeStart = !audioStreamActive
     }
 
-    /// Every MIC_OPEN/AUDIO_START is a new ADPCM stream. Xiaomi's remote does
-    /// not reliably send an AUDIO_SYNC before the first packets of each
-    /// subsequent stream, so carrying the previous stream's predictor and
-    /// step index corrupts everything after the first recording.
-    func beginAudioStream(codec: ATVVCodec) {
-        self.codec = codec
+    /// Prepare a clean decoder before asking the remote to open a new stream.
+    ///
+    /// This deliberately happens before MIC_OPEN. ATVV may deliver AUDIO_SYNC
+    /// before or after AUDIO_START; resetting at AUDIO_START would erase a
+    /// perfectly valid sync that arrived first and intermittently corrupt the
+    /// whole recording.
+    func prepareForAudioStream() {
         v10Sequence = 0
         decoder.reset(predictor: 0, stepIndex: 0)
+        audioStreamActive = false
+        hasPendingSyncBeforeStart = false
+    }
+
+    /// Start a new decoder session. Some Xiaomi firmware goes straight to
+    /// AUDIO_START without START_SEARCH/MIC_OPEN and without AUDIO_SYNC. In
+    /// that case AUDIO_START itself must reset stale ADPCM state. When a fresh
+    /// AUDIO_SYNC did arrive first, preserve the synchronized state instead.
+    func beginAudioStream(codec: ATVVCodec) {
+        self.codec = codec
+        if !hasPendingSyncBeforeStart {
+            v10Sequence = 0
+            decoder.reset(predictor: 0, stepIndex: 0)
+        }
+        audioStreamActive = true
+        hasPendingSyncBeforeStart = false
+    }
+
+    func endAudioStream() {
+        audioStreamActive = false
+        hasPendingSyncBeforeStart = false
     }
 
     func decodeAudio(_ data: Data) -> (sequence: UInt16, samples: [Int16])? {

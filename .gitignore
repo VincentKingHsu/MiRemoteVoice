@@ -1,6 +1,6 @@
 .DS_Store
 .vscode/
-mi-ao/
+DEL/
 
 **/.build/
 **/dist/
@@ -9,4 +9,3 @@ mi-ao/
 *.wav
 *.raw.bin
 *.pcm
-

@@ -1,6 +1,6 @@
 // mi-remote-bridge: button + voice bridge for Xiaomi Mi Bluetooth Remote 2 Pro.
 //
-// 1. Voice key (HID F5) → suppressed → matching Option down/up (Doubao push-to-talk)
+// 1. Voice key (HID F5) → suppressed → matching Option press semantics
 // 2. ATVV voice stream over BLE → decoded ADPCM → MiRemoteV 2ch
 //    → macOS audio input → Doubao hears the remote's mic
 //
@@ -23,38 +23,11 @@ import Darwin
 import IOKit.hid
 import Foundation
 
-// MARK: - Logger that writes to a file (NSApplication detaches stdout)
-
-enum Log {
-    private static let path: String = {
-        let env = ProcessInfo.processInfo.environment["MIA_LOG"] ?? "/tmp/mi-bridge.log"
-        let url = URL(fileURLWithPath: env)
-        // truncate on start
-        try? Data().write(to: url)
-        return env
-    }()
-    private static let handle: FileHandle? = {
-        FileHandle(forWritingAtPath: path)
-    }()
-
-    static func write(_ s: String) {
-        let line = "[\(Date())] \(s)\n"
-        // also try stdout for any pre-NSApplication prints
-        FileHandle.standardOutput.write(Data(line.utf8))
-        if let h = handle {
-            h.write(Data(line.utf8))
-        }
-    }
-}
-
-func print(_ s: String) {
-    Log.write(s)
-}
-
 // MARK: - Virtual key codes
 
 enum VK {
     static let option: CGKeyCode = 0x3A
+    static let rightOption: CGKeyCode = 0x3D
     /// The 2 Pro reports voice key as USB HID usage 0x3D which macOS maps
     /// to virtual keyCode 0x60 (F5). Despite being labeled "F6" in some
     /// hardware profiles, the actual delivery is F5. Verified empirically.
@@ -64,16 +37,28 @@ enum VK {
 // MARK: - Key synthesizer
 
 enum Key {
+    /// Lets the event tap distinguish Bridge-generated Option events from
+    /// physical keyboards, other Bluetooth buttons, and external remappers.
+    static let syntheticMarker: Int64 = 0x4D_49_52_42 // "MIRB"
+
     /// Walkie-talkie style: Option key down only (no matching up). Pair with `optionUp`.
     static func optionDown() {
         let src = CGEventSource(stateID: .hidSystemState)
         if let e = CGEvent(keyboardEventSource: src, virtualKey: VK.option, keyDown: true) {
+            e.setIntegerValueField(
+                .eventSourceUserData,
+                value: syntheticMarker
+            )
             e.post(tap: .cghidEventTap)
         }
     }
     static func optionUp() {
         let src = CGEventSource(stateID: .hidSystemState)
         if let e = CGEvent(keyboardEventSource: src, virtualKey: VK.option, keyDown: false) {
+            e.setIntegerValueField(
+                .eventSourceUserData,
+                value: syntheticMarker
+            )
             e.post(tap: .cghidEventTap)
         }
     }
@@ -109,17 +94,16 @@ final class VoicePressCoordinator {
     }
 
     private let longPressThreshold: TimeInterval = 0.30
+    // The remote sends AUDIO_STOP before the HID key-up, so there is no BLE
+    // tail left to wait for here. Keeping this delay near zero makes Doubao
+    // leave its recording UI as soon as the user releases the button.
+    private let tailDrainDelay: TimeInterval = 0.02
     private var mode: Mode = .idle
     private var holdWorkItem: DispatchWorkItem?
+    private var tailWorkItem: DispatchWorkItem?
     private var remoteStreaming = false
     private var remoteRouted = false
-    /// Doubao treats a short Option click as a toggle. Remember only the
-    /// toggle state created by this bridge so a later hold can cancel it
-    /// before starting push-to-talk.
-    private var shortToggleActive = false
-    private var longToggleStarted = false
-    private var longToggleStartInFlight = false
-    private var longReleasePending = false
+    private var optionIsHeld = false
     private var suppressNewPressUntil = Date.distantPast
 
     func keyDown() {
@@ -151,30 +135,23 @@ final class VoicePressCoordinator {
         case .pending:
             mode = .idle
             setRemoteRouted(false)
-            shortToggleActive.toggle()
-            print(
-                "[PRESS] SHORT → Option tap; source=MacBook; toggle=" +
-                (shortToggleActive ? "on" : "off")
-            )
+            print("[PRESS] SHORT → Option tap; source=MacBook")
             Key.optionTap()
         case .holding:
             mode = .idle
-            suppressNewPressUntil = Date().addingTimeInterval(0.25)
-            print("[PRESS] LONG end → Option tap OFF; source=MacBook")
-            if longToggleStartInFlight {
-                longReleasePending = true
-            } else {
-                finishLongToggle()
-            }
-            setRemoteRouted(false)
+            suppressNewPressUntil = Date().addingTimeInterval(
+                tailDrainDelay + 0.10
+            )
+            print("[PRESS] LONG release → finish immediately")
+            scheduleLongFinish()
         }
     }
 
     func setRemoteStreaming(_ streaming: Bool) {
         remoteStreaming = streaming
-        // Short presses may make the remote advertise a very brief ATVV
-        // stream. Route it only after the key gesture has become a hold.
-        setRemoteRouted(mode == .holding && streaming)
+        // BLE availability is informational only. HID owns gesture lifetime
+        // and routing policy; transient ATVV stop/start events must never
+        // toggle Doubao or fall back to the MacBook mic during a hold.
         print(
             "[PRESS] ATVV streaming=\(streaming); " +
             "gesture=\(modeName); routed=\(remoteRouted)"
@@ -184,11 +161,12 @@ final class VoicePressCoordinator {
     func stop() {
         holdWorkItem?.cancel()
         holdWorkItem = nil
-        if longToggleStarted {
-            longToggleStarted = false
-            Key.optionTap()
+        tailWorkItem?.cancel()
+        tailWorkItem = nil
+        if optionIsHeld {
+            optionIsHeld = false
+            Key.optionUp()
         }
-        longReleasePending = false
         mode = .idle
         setRemoteRouted(false)
     }
@@ -198,56 +176,49 @@ final class VoicePressCoordinator {
         holdWorkItem = nil
         mode = .holding
 
-        // If our previous short press left Doubao's toggle recording on,
-        // switch that mode off first. Otherwise a normal Option hold/release
-        // returns Doubao to the already-on toggle state and appears "stuck".
-        if shortToggleActive {
-            shortToggleActive = false
-            print("[PRESS] LONG preparing → cancel previous short-toggle")
-            Key.optionTap { [weak self] in
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.10) {
-                    self?.startOptionHold()
-                }
-            }
-            return
-        }
-
-        startOptionHold()
+        // Route selection follows the physical HID hold, not BLE notifications.
+        // If ATVV is late or briefly drops, emit silence rather than leaking
+        // the MacBook microphone into a remote-only gesture.
+        setRemoteRouted(true)
+        print(
+            "[PRESS] LONG start → Option DOWN; source=" +
+            (remoteStreaming ? "remote ready" : "remote waiting")
+        )
+        optionIsHeld = true
+        Key.optionDown()
     }
 
-    private func startOptionHold() {
-        guard mode == .holding,
-              !longToggleStarted,
-              !longToggleStartInFlight
-        else { return }
-
-        // Put the desired source in place before opening Doubao so its first
-        // captured frame already comes from the remote when ATVV is ready.
-        setRemoteRouted(remoteStreaming)
-        print(
-            "[PRESS] LONG start → Option tap ON; source=" +
-            (remoteRouted ? "remote" : "MacBook fallback")
-        )
-        longToggleStartInFlight = true
-        Key.optionTap { [weak self] in
-            guard let self else { return }
-            self.longToggleStartInFlight = false
-            self.longToggleStarted = true
-            if self.longReleasePending {
-                // Keep the two complete clicks distinct even if the physical
-                // button was released immediately after long-press promotion.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                    self.finishLongToggle()
-                }
-            }
+    private func scheduleLongFinish() {
+        guard optionIsHeld else {
+            setRemoteRouted(false)
+            return
         }
+        tailWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.tailWorkItem = nil
+            self?.finishLongToggle()
+        }
+        tailWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + tailDrainDelay,
+            execute: work
+        )
     }
 
     private func finishLongToggle() {
-        guard longToggleStarted else { return }
-        longToggleStarted = false
-        longReleasePending = false
-        Key.optionTap()
+        guard optionIsHeld else { return }
+        optionIsHeld = false
+        print("[PRESS] LONG end → Option UP + closing tap")
+        Key.optionUp()
+        // macOS releases the modifier state correctly, but Doubao's input
+        // method sometimes keeps its recording UI latched after a synthetic
+        // modifier-up. A complete follow-up Option click is the same action
+        // the user currently has to perform manually to close that latch.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
+            Key.optionTap {
+                self?.setRemoteRouted(false)
+            }
+        }
     }
 
     private func setRemoteRouted(_ active: Bool) {
@@ -366,13 +337,23 @@ final class VoiceKeyFilter {
             throw FilterError.accessibilityDenied
         }
 
-        let mask: CGEventMask = (1 << CGEventType.keyDown.rawValue) | (1 << CGEventType.keyUp.rawValue)
+        let mask: CGEventMask =
+            (1 << CGEventType.keyDown.rawValue) |
+            (1 << CGEventType.keyUp.rawValue)
         let callback: CGEventTapCallBack = { (_, type, event, userInfo) -> Unmanaged<CGEvent>? in
             guard let userInfo else { return Unmanaged.passRetained(event) }
             let filter = Unmanaged<VoiceKeyFilter>.fromOpaque(userInfo).takeUnretainedValue()
-            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-            let descr = type == .keyDown ? "down" : (type == .keyUp ? "up" : "other")
-            print("[KEY] \(descr) keyCode=0x\(String(keyCode, radix: 16))")
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let tap = filter.tapPort {
+                    CGEvent.tapEnable(tap: tap, enable: true)
+                    print("[FILTER] event tap was disabled; re-enabled")
+                }
+                return Unmanaged.passRetained(event)
+            }
+            let keyCode = CGKeyCode(
+                event.getIntegerValueField(.keyboardEventKeycode)
+            )
+
             if keyCode == VK.voiceKey {
                 if type == .keyDown {
                     let isRepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
@@ -424,11 +405,18 @@ final class VoiceKeyFilter {
 
 // MARK: - Menu bar UI
 
-final class AppController: NSObject, NSApplicationDelegate {
+final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var headerLabel: NSMenuItem!
-    private var audioLabel: NSMenuItem!
-    private var levelLabel: NSMenuItem!
+    private var launchAtLoginItem: NSMenuItem!
+    private var loggingToggleItem: NSMenuItem!
+    private var logSizeItem: NSMenuItem!
+    private var recordingToggleItem: NSMenuItem!
+    private var recordingSizeItem: NSMenuItem!
+
+    private var hidConnected = false
+    private var bleConnected = false
+    private var remoteStreaming = false
 
     private let watcher = HIDWatcher()
     private let filter = VoiceKeyFilter()
@@ -437,45 +425,57 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        AppStorage.prepare()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.title = "⚠️"
 
         let menu = NSMenu()
-        let header = NSMenuItem(title: "米遥桥 · 启动中", action: nil, keyEquivalent: "")
+        menu.delegate = self
+        let header = NSMenuItem(title: "状态 · 启动中", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
         headerLabel = header
 
-        let audio = NSMenuItem(title: "ATVV · 等连接", action: nil, keyEquivalent: "")
-        audio.isEnabled = false
-        menu.addItem(audio)
-        audioLabel = audio
-
-        let level = NSMenuItem(title: "电平: 等待", action: nil, keyEquivalent: "")
-        level.isEnabled = false
-        menu.addItem(level)
-        levelLabel = level
-
-        menu.addItem(.separator())
-        let hint = NSMenuItem(title: "语音键 (F5) → Option 长按", action: nil, keyEquivalent: "")
-        hint.isEnabled = false
-        menu.addItem(hint)
+        let launch = NSMenuItem(
+            title: "登录时自动启动",
+            action: #selector(toggleLaunchAtLogin),
+            keyEquivalent: ""
+        )
+        launch.target = self
+        menu.addItem(launch)
+        launchAtLoginItem = launch
 
         menu.addItem(.separator())
+        menu.addItem(makeLogMenu())
+        menu.addItem(makeRecordingMenu())
+
+        menu.addItem(.separator())
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "未知"
+        let versionItem = NSMenuItem(
+            title: "版本 · \(version)",
+            action: nil,
+            keyEquivalent: ""
+        )
+        versionItem.isEnabled = false
+        menu.addItem(versionItem)
+
         let quit = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
         statusItem.menu = menu
+        refreshMenuState()
 
         // HID connection (status icon).
-        watcher.onConnect = { [weak self] name in
-            self?.headerLabel.title = "HID · 已连接: \(name)"
-            self?.statusItem.button?.title = "🎤"
+        watcher.onConnect = { [weak self] _ in
+            self?.hidConnected = true
+            self?.updateStatus()
         }
         watcher.onDisconnect = { [weak self] _ in
-            self?.headerLabel.title = "HID · 等连接"
-            self?.statusItem.button?.title = "⚠️"
+            self?.hidConnected = false
+            self?.updateStatus()
         }
         watcher.start()
 
@@ -487,22 +487,14 @@ final class AppController: NSObject, NSApplicationDelegate {
             self?.voicePress.keyUp()
         }
         ble.onConnectionChanged = { [weak self] connected in
-            self?.audioLabel.title = connected
-                ? "ATVV · 已连 (语音流可用)"
-                : "ATVV · 等待/重连"
-            if !connected { self?.levelLabel.title = "电平: 等待连接" }
+            self?.bleConnected = connected
+            if !connected { self?.remoteStreaming = false }
+            self?.updateStatus()
         }
         ble.onStreamingChanged = { [weak self] streaming, _ in
             self?.voicePress.setRemoteStreaming(streaming)
-            self?.audioLabel.title = streaming
-                ? "ATVV · 🎙️ 正在录音"
-                : "ATVV · 已连"
-        }
-        ble.onLevel = { [weak self] db, peak in
-            let n = max(0, min(10, Int((db + 60) / 6)))
-            let bar = String(repeating: "▓", count: n) + String(repeating: "░", count: 10 - n)
-            self?.levelLabel.title = String(format: "电平: [%@] %.0f dB  peak %d",
-                                              bar, db, peak)
+            self?.remoteStreaming = streaming
+            self?.updateStatus()
         }
         ble.start()
 
@@ -515,9 +507,186 @@ final class AppController: NSObject, NSApplicationDelegate {
             try filter.start()
         } catch {
             let msg = error.localizedDescription
-            audioLabel.title = "ERR · \(msg)"
+            headerLabel.title = "状态 · \(msg)"
+            statusItem.button?.title = "⚠️"
             print("[ERR] filter: \(msg)")
         }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshMenuState()
+    }
+
+    private func makeLogMenu() -> NSMenuItem {
+        let root = NSMenuItem(title: "日志", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "日志")
+
+        let toggle = NSMenuItem(
+            title: "记录日志",
+            action: #selector(toggleLogging),
+            keyEquivalent: ""
+        )
+        toggle.target = self
+        submenu.addItem(toggle)
+        loggingToggleItem = toggle
+
+        let size = NSMenuItem(title: "占用 · 0 字节", action: nil, keyEquivalent: "")
+        size.isEnabled = false
+        submenu.addItem(size)
+        logSizeItem = size
+
+        let refresh = NSMenuItem(
+            title: "刷新占用大小",
+            action: #selector(refreshStorageSizes),
+            keyEquivalent: ""
+        )
+        refresh.target = self
+        submenu.addItem(refresh)
+
+        let open = NSMenuItem(
+            title: "打开日志文件夹",
+            action: #selector(openLogFolder),
+            keyEquivalent: ""
+        )
+        open.target = self
+        submenu.addItem(open)
+
+        let clear = NSMenuItem(
+            title: "清空日志",
+            action: #selector(clearLog),
+            keyEquivalent: ""
+        )
+        clear.target = self
+        submenu.addItem(clear)
+
+        root.submenu = submenu
+        return root
+    }
+
+    private func makeRecordingMenu() -> NSMenuItem {
+        let root = NSMenuItem(title: "调试录音", action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: "调试录音")
+
+        let toggle = NSMenuItem(
+            title: "保存 WAV 与原始数据",
+            action: #selector(toggleRecording),
+            keyEquivalent: ""
+        )
+        toggle.target = self
+        submenu.addItem(toggle)
+        recordingToggleItem = toggle
+
+        let size = NSMenuItem(title: "占用 · 0 字节", action: nil, keyEquivalent: "")
+        size.isEnabled = false
+        submenu.addItem(size)
+        recordingSizeItem = size
+
+        let refresh = NSMenuItem(
+            title: "刷新占用大小",
+            action: #selector(refreshStorageSizes),
+            keyEquivalent: ""
+        )
+        refresh.target = self
+        submenu.addItem(refresh)
+
+        let open = NSMenuItem(
+            title: "打开录音文件夹",
+            action: #selector(openRecordingFolder),
+            keyEquivalent: ""
+        )
+        open.target = self
+        submenu.addItem(open)
+
+        let clear = NSMenuItem(
+            title: "清空录音文件",
+            action: #selector(clearRecordings),
+            keyEquivalent: ""
+        )
+        clear.target = self
+        submenu.addItem(clear)
+
+        root.submenu = submenu
+        return root
+    }
+
+    private func updateStatus() {
+        if remoteStreaming {
+            headerLabel.title = "状态 · 遥控器录音中"
+            statusItem.button?.title = "🎙️"
+        } else if hidConnected && bleConnected {
+            headerLabel.title = "状态 · 已就绪"
+            statusItem.button?.title = "🎤"
+        } else if hidConnected || bleConnected {
+            headerLabel.title = "状态 · 正在连接语音服务"
+            statusItem.button?.title = "⏳"
+        } else {
+            headerLabel.title = "状态 · 等待遥控器"
+            statusItem.button?.title = "⚠️"
+        }
+    }
+
+    private func refreshMenuState() {
+        launchAtLoginItem?.state = LaunchAtLogin.isEnabled ? .on : .off
+        loggingToggleItem?.state = Log.isEnabled ? .on : .off
+        recordingToggleItem?.state = AppStorage.recordingEnabled ? .on : .off
+        refreshSizeLabels()
+    }
+
+    private func refreshSizeLabels() {
+        logSizeItem?.title = "占用 · \(AppStorage.formattedSize(Log.byteSize))"
+        let recordingBytes = AppStorage.byteSize(
+            of: AppStorage.recordingsDirectory
+        )
+        recordingSizeItem?.title =
+            "占用 · \(AppStorage.formattedSize(recordingBytes))"
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        do {
+            try LaunchAtLogin.setEnabled(!LaunchAtLogin.isEnabled)
+        } catch {
+            headerLabel.title = "状态 · 登录启动设置失败"
+        }
+        refreshMenuState()
+    }
+
+    @objc private func toggleLogging() {
+        Log.setEnabled(!Log.isEnabled)
+        if Log.isEnabled {
+            print("[APP] 日志已由用户开启")
+        }
+        refreshMenuState()
+    }
+
+    @objc private func toggleRecording() {
+        let enabled = !AppStorage.recordingEnabled
+        AppStorage.recordingEnabled = enabled
+        ble.setRecordingEnabled(enabled)
+        refreshMenuState()
+    }
+
+    @objc private func refreshStorageSizes() {
+        refreshSizeLabels()
+    }
+
+    @objc private func openLogFolder() {
+        AppStorage.ensureDirectory(AppStorage.logsDirectory)
+        NSWorkspace.shared.open(AppStorage.logsDirectory)
+    }
+
+    @objc private func openRecordingFolder() {
+        AppStorage.ensureDirectory(AppStorage.recordingsDirectory)
+        NSWorkspace.shared.open(AppStorage.recordingsDirectory)
+    }
+
+    @objc private func clearLog() {
+        Log.clear()
+        refreshSizeLabels()
+    }
+
+    @objc private func clearRecordings() {
+        ble.clearRecordings()
+        refreshSizeLabels()
     }
 
     @objc private func quit() {

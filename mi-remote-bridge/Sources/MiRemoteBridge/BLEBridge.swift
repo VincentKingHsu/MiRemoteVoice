@@ -53,9 +53,12 @@ final class BLEBridge: NSObject {
     private var streamFrameCount = 0
     private var streamSampleCount = 0
     private var streamPeak = 0
+    private var streamSumSquares: Int64 = 0
+    private var streamClippedSampleCount = 0
+    private var pendingAudioSyncCount = 0
+    private var streamAudioSyncCount = 0
     private var wavRecorder: WavRecorder?
-    // Recording and verbose PCM diagnostics are off by default.
-    private static let recordingEnabled = false
+    // Verbose PCM diagnostics are off unless explicitly requested.
     private static let diagnosticsEnabled =
         ProcessInfo.processInfo.environment["MIA_DIAGNOSTICS"] == "1"
     private var lastStartSearchAt = Date.distantPast
@@ -71,6 +74,24 @@ final class BLEBridge: NSObject {
         } else {
             print("[BLE] 等待蓝牙就绪…")
         }
+    }
+
+    func setRecordingEnabled(_ enabled: Bool) {
+        AppStorage.recordingEnabled = enabled
+        if enabled, isStreaming, wavRecorder == nil {
+            wavRecorder = WavRecorder.createNext(prefix: "mi-voice")
+        } else if !enabled, let recorder = wavRecorder {
+            recorder.close()
+            wavRecorder = nil
+        }
+    }
+
+    func clearRecordings() {
+        if let recorder = wavRecorder {
+            recorder.close()
+            wavRecorder = nil
+        }
+        AppStorage.clearFiles(in: AppStorage.recordingsDirectory)
     }
 
     /// If we have a saved UUID from a previous scan, ask CoreBluetooth for
@@ -318,6 +339,10 @@ extension BLEBridge: CBPeripheralDelegate {
             if now.timeIntervalSince(lastStartSearchAt) < 0.5 { return }
             lastStartSearchAt = now
             do {
+                // Reset before MIC_OPEN so a subsequent AUDIO_SYNC remains
+                // authoritative even when it arrives before AUDIO_START.
+                protocolHandler.prepareForAudioStream()
+                pendingAudioSyncCount = 0
                 writeCommand(try protocolHandler.micOpenCommand())
                 print("[BLE] TX micOpen (debounced)")
             } catch {
@@ -339,13 +364,18 @@ extension BLEBridge: CBPeripheralDelegate {
             streamFrameCount = 0
             streamSampleCount = 0
             streamPeak = 0
-            wavRecorder = Self.recordingEnabled
+            streamSumSquares = 0
+            streamClippedSampleCount = 0
+            streamAudioSyncCount = pendingAudioSyncCount
+            pendingAudioSyncCount = 0
+            wavRecorder = AppStorage.recordingEnabled
                 ? WavRecorder.createNext(prefix: "mi-voice")
                 : nil
             startKeepAliveTimer()
             print("[BLE] AUDIO_START streamID=\(sid)")
         case .audioStop(let reason):
             isStreaming = false
+            protocolHandler.endAudioStream()
             notifyStreaming(false)
             levelSumSq = 0
             levelCount = 0
@@ -353,15 +383,42 @@ extension BLEBridge: CBPeripheralDelegate {
             onLevel?(-120, 0)
             diagFrameCount = 0
             stopKeepAliveTimer()
-            if let w = wavRecorder { w.close(); print("[WAV] closed /tmp/\(w.filename)"); wavRecorder = nil }
+            if let w = wavRecorder {
+                w.close()
+                print("[WAV] closed \(w.filename)")
+                wavRecorder = nil
+            }
+            let streamRMS = streamSampleCount > 0
+                ? sqrt(Double(streamSumSquares) / Double(streamSampleCount))
+                : 0
+            let streamDB = streamRMS > 0
+                ? 20.0 * log10(streamRMS / 32768.0)
+                : -120
             print(
                 "[BLE] AUDIO_SUMMARY streamID=\(streamID) " +
                 "frames=\(streamFrameCount) samples=\(streamSampleCount) " +
-                "peak=\(streamPeak)"
+                "peak=\(streamPeak) rms=\(Int(streamRMS.rounded())) " +
+                "db=\(String(format: "%.1f", streamDB)) " +
+                "clipped=\(streamClippedSampleCount) syncs=\(streamAudioSyncCount)"
             )
             print("[BLE] AUDIO_STOP reason=0x\(String(format: "%02x", reason))")
-        case .audioSync(let codec, _, let pred, let stepIndex):
-            protocolHandler.applyAudioSync(codec: codec, sequence: 0, predictor: pred, stepIndex: stepIndex)
+        case .audioSync(let codec, let sequence, let pred, let stepIndex):
+            protocolHandler.applyAudioSync(
+                codec: codec,
+                sequence: sequence,
+                predictor: pred,
+                stepIndex: stepIndex
+            )
+            if isStreaming {
+                streamAudioSyncCount += 1
+            } else {
+                pendingAudioSyncCount += 1
+            }
+            print(
+                "[BLE] AUDIO_SYNC codec=\(codec) sequence=\(sequence) " +
+                "predictor=\(pred) step=\(stepIndex) " +
+                "phase=\(isStreaming ? "streaming" : "opening")"
+            )
         case .micOpenError(let code):
             print("[BLE] MIC_OPEN 错误: 0x\(String(format: "%04x", code))")
         case .unknown(let d):
@@ -391,6 +448,12 @@ extension BLEBridge: CBPeripheralDelegate {
             streamPeak,
             frame.samples.map { Int(abs(Int($0))) }.max() ?? 0
         )
+        streamSumSquares += frame.samples.reduce(into: Int64(0)) {
+            $0 += Int64($1) * Int64($1)
+        }
+        streamClippedSampleCount += frame.samples.reduce(into: 0) {
+            if abs(Int($1)) >= 32_760 { $0 += 1 }
+        }
 
         // Diagnostic: dump first few raw bytes & first few decoded samples
         if Self.diagnosticsEnabled, diagFrameCount < 5 {
@@ -408,10 +471,18 @@ extension BLEBridge: CBPeripheralDelegate {
         }
 
         AudioPipe.shared.feed(samples: frame.samples)
-        levelSumSq += frame.samples.reduce(into: 0) { $0 += Int64($1) * Int64($1) }
-        levelCount += frame.samples.count
-        levelPeak = max(levelPeak, frame.samples.map { Int(abs(Int($0))) }.max() ?? 0)
-        if Date().timeIntervalSince(levelLogAt) >= 0.5 {
+        let needsLevel = onLevel != nil || Self.diagnosticsEnabled
+        if needsLevel {
+            levelSumSq += frame.samples.reduce(into: 0) {
+                $0 += Int64($1) * Int64($1)
+            }
+            levelCount += frame.samples.count
+            levelPeak = max(
+                levelPeak,
+                frame.samples.map { Int(abs(Int($0))) }.max() ?? 0
+            )
+        }
+        if needsLevel, Date().timeIntervalSince(levelLogAt) >= 0.5 {
             let rms = levelCount > 0 ? sqrt(Double(levelSumSq) / Double(levelCount)) : 0
             let peak = levelPeak
             let db = rms > 0 ? 20.0 * log10(rms / 32768.0) : -120
